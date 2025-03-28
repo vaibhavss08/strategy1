@@ -2,7 +2,6 @@ import asyncio
 import numpy as np
 import pandas as pd
 import ccxt.async_support as ccxt
-import logging
 import ta
 import time
 import json
@@ -16,33 +15,24 @@ try:
 except ImportError:
     pass
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading_bot_realtime.log'),
-        logging.StreamHandler()
-    ]
-)
-
 class TradingBot:
     def __init__(self):
         self.exchange = None
         self.ws = None
         self.ws_connected = False
         self.last_ws_message = 0
-        self.ws_queue = asyncio.Queue(maxsize=1000)  # Buffer for WebSocket messages
-        self.price_queue = defaultdict(lambda: deque(maxlen=1800))  # 30 min * 60 sec = 1800 slots
-        self.data_1min = defaultdict(lambda: deque(maxlen=200))  # For indicators
-        self.data_15min = defaultdict(lambda: deque(maxlen=200))  # For indicators
+        self.ws_queue = asyncio.Queue(maxsize=1000)
+        self.price_queue = defaultdict(lambda: deque(maxlen=300))  # 5 min * 60 sec = 300 slots
+        self.data_1min = defaultdict(lambda: deque(maxlen=200))
+        self.data_15min = defaultdict(lambda: deque(maxlen=200))
         self.indicators = defaultdict(dict)
         self.live_prices = {}
         self.positions = {}
-        self.capital = 1000  # Starting capital for paper trading
+        self.capital = 1000
         self.last_trade_time = {}
-        self.last_log_time = 0  # Single timestamp for all symbols
-        self.pending_updates = defaultdict(dict)  # Buffer updates per symbol
-        self.latest_timestamps = defaultdict(int)  # Store latest timestamp per symbol
+        self.last_print_time = 0
+        self.pending_updates = defaultdict(dict)
+        self.latest_timestamps = defaultdict(int)
         self.tasks = []
         self.price_precision = {}
         self.min_position_size = 0.001
@@ -50,8 +40,8 @@ class TradingBot:
         self.candle_count = defaultdict(int)
         
         self.LEVERAGE = 10
-        self.MAX_POSITIONS = 2
-        self.TREND_THRESHOLD = 0.00005
+        self.MAX_POSITIONS = 2  # Strict limit
+        self.TREND_THRESHOLD = 0.0010
         self.RISK_PER_TRADE = 0.02
         self.VOLUME_THRESHOLD = 30000000
         self.COOLDOWN_SECONDS = 30
@@ -59,20 +49,21 @@ class TradingBot:
         self.WS_TIMEOUT = 60
         self.WS_RECONNECT_DELAY = 5
         self.MAX_RECONNECT_ATTEMPTS = 10
-        self.LIVE_TRADING = False  # Set to False for paper trading
-        self.MAX_STREAMS = 40  # Increased to match all symbols
+        self.LIVE_TRADING = False
+        self.MAX_STREAMS = 40
+        self.TAKE_PROFIT_MULTIPLIER = 2.5
 
     async def initialize(self):
         await self.initialize_exchange()
-        self.active_symbols = await self.get_futures_symbols(40)  # Limited for performance
-        logging.info(f"Loaded symbols: {self.active_symbols}")
+        self.active_symbols = await self.get_futures_symbols(40)
+        print(f"Loaded symbols: {self.active_symbols}")
         await self.load_initial_data(self.active_symbols)
         
         self.tasks = [
             asyncio.create_task(self.websocket_handler()),
             asyncio.create_task(self.process_ws_queue()),
             asyncio.create_task(self.update_prices()),
-            asyncio.create_task(self.log_prices()),
+            asyncio.create_task(self.print_prices()),
             asyncio.create_task(self.trading_engine()),
             asyncio.create_task(self.connection_monitor())
         ]
@@ -92,9 +83,9 @@ class TradingBot:
             markets = await self.exchange.load_markets()
             for symbol, market in markets.items():
                 self.price_precision[symbol] = market['precision']['price']
-            logging.info("Exchange initialized successfully")
+            print("Exchange initialized successfully")
         except Exception as e:
-            logging.error(f"Exchange init failed: {e}", exc_info=True)
+            print(f"Exchange init failed: {e}")
             raise
 
     async def get_futures_symbols(self, limit=None):
@@ -111,44 +102,54 @@ class TradingBot:
                                           reverse=True)[:limit]
             return high_volume_symbols if high_volume_symbols else ['BTC/USDT:USDT', 'ETH/USDT:USDT']
         except Exception as e:
-            logging.error(f"Error fetching futures symbols: {e}")
+            print(f"Error fetching futures symbols: {e}")
             return ['BTC/USDT:USDT', 'ETH/USDT:USDT']
 
     async def load_initial_data(self, symbols):
         try:
             if not symbols:
-                logging.warning("No symbols provided to load initial data")
+                print("No symbols provided to load initial data")
                 return
             tasks = [self.load_symbol_data(symbol) for symbol in symbols]
             await asyncio.gather(*tasks)
-            logging.info(f"Initial data loaded for {len(symbols)} symbols")
+            print(f"Initial data loaded for {len(symbols)} symbols")
         except Exception as e:
-            logging.error(f"Error loading initial data: {e}")
+            print(f"Error loading initial data: {e}")
 
     async def load_symbol_data(self, symbol):
         try:
-            candles_1m, candles_15m = await asyncio.gather(
-                self.exchange.fetch_ohlcv(symbol, '1m', limit=200),
-                self.exchange.fetch_ohlcv(symbol, '15m', limit=200)
-            )
+            candles_1m = await self.exchange.fetch_ohlcv(symbol, '1m', limit=200)
             self.data_1min[symbol].clear()
             self.data_15min[symbol].clear()
-            self.price_queue[symbol].clear()  # Start with empty queue
+            self.price_queue[symbol].clear()
+            
+            # Load 1-minute OHLCV
             for candle in candles_1m:
                 self.data_1min[symbol].append({
                     'timestamp': candle[0], 'open': float(candle[1]), 'high': float(candle[2]),
                     'low': float(candle[3]), 'close': float(candle[4]), 'volume': float(candle[5])
                 })
+            
+            # Pre-fill price_queue with last 5 minutes (300 seconds) using last 5 candles
+            last_5_candles = list(self.data_1min[symbol])[-5:]
+            for candle in last_5_candles:
+                close_price = candle['close']
+                for _ in range(60):
+                    self.price_queue[symbol].append(close_price)
+            
+            # Load 15-minute OHLCV
+            candles_15m = await self.exchange.fetch_ohlcv(symbol, '15m', limit=200)
             for candle in candles_15m:
                 self.data_15min[symbol].append({
                     'timestamp': candle[0], 'open': float(candle[1]), 'high': float(candle[2]),
                     'low': float(candle[3]), 'close': float(candle[4]), 'volume': float(candle[5])
                 })
+            
             self.calculate_indicators(symbol)
             self.live_prices[symbol] = float(candles_1m[-1][4])
             self.latest_timestamps[symbol] = candles_1m[-1][0]
         except Exception as e:
-            logging.warning(f"Error loading data for {symbol}: {e}")
+            print(f"Error loading data for {symbol}: {e}")
 
     def calculate_indicators(self, symbol):
         try:
@@ -171,7 +172,7 @@ class TradingBot:
             indicators['ema_200_15m'] = ta.trend.EMAIndicator(close_15m, window=200).ema_indicator().iloc[-1]
             self.indicators[symbol] = indicators
         except Exception as e:
-            logging.warning(f"Error calculating indicators for {symbol}: {e}")
+            print(f"Error calculating indicators for {symbol}: {e}")
 
     async def websocket_handler(self):
         reconnect_attempts = 0
@@ -180,31 +181,31 @@ class TradingBot:
                 streams = [f"{symbol.split('/')[0].lower().replace('1000', '')}usdt@kline_1m" 
                           for symbol in self.active_symbols[:self.MAX_STREAMS]]
                 ws_url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-                logging.info(f"Connecting to WebSocket with {len(streams)} streams")
+                print(f"Connecting to WebSocket with {len(streams)} streams")
                 
                 async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as websocket:
                     self.ws = websocket
                     self.ws_connected = True
                     self.last_ws_message = time.time()
-                    logging.info("WebSocket connected successfully")
+                    print("WebSocket connected successfully")
                     reconnect_attempts = 0
                     
                     while True:
                         try:
                             message = await asyncio.wait_for(websocket.recv(), timeout=self.WS_TIMEOUT)
                             self.last_ws_message = time.time()
-                            await self.ws_queue.put(json.loads(message))  # Queue the message
+                            await self.ws_queue.put(json.loads(message))
                         except asyncio.TimeoutError:
-                            logging.warning("WebSocket timeout")
+                            print("WebSocket timeout")
                             break
                         except Exception as e:
-                            logging.warning(f"WebSocket message error: {e}")
+                            print(f"WebSocket message error: {e}")
             except Exception as e:
-                logging.error(f"WebSocket connection error: {e}")
+                print(f"WebSocket connection error: {e}")
                 self.ws_connected = False
                 reconnect_attempts += 1
                 if reconnect_attempts > self.MAX_RECONNECT_ATTEMPTS:
-                    logging.error("Max reconnect attempts reached. Shutting down.")
+                    print("Max reconnect attempts reached. Shutting down.")
                     raise
                 await asyncio.sleep(self.WS_RECONNECT_DELAY)
 
@@ -223,14 +224,12 @@ class TradingBot:
                 if symbol not in self.active_symbols:
                     continue
                 
-                # Buffer latest update
                 self.pending_updates[symbol] = {
                     'price': float(kline['c']),
                     'timestamp': kline['t'],
                     'kline': kline
                 }
                 
-                # Process finalized 1m candles for indicators
                 if kline['x']:
                     candle = {
                         'timestamp': kline['t'],
@@ -259,12 +258,12 @@ class TradingBot:
                 
                 self.ws_queue.task_done()
             except Exception as e:
-                logging.warning(f"Queue processing error: {e}")
-            await asyncio.sleep(0)  # Yield control
+                print(f"Queue processing error: {e}")
+            await asyncio.sleep(0)
 
     async def update_prices(self):
         while True:
-            await asyncio.sleep(1)  # Update every second
+            await asyncio.sleep(1)
             current_time = time.time()
             current_ms = int(current_time * 1000)
             for symbol in self.active_symbols:
@@ -274,7 +273,6 @@ class TradingBot:
                     timestamp = update['timestamp']
                     del self.pending_updates[symbol]
                 else:
-                    # Use last known price if no update
                     price = self.live_prices.get(symbol, 0.0)
                     timestamp = self.latest_timestamps[symbol] or current_ms
                 
@@ -282,22 +280,18 @@ class TradingBot:
                 self.live_prices[symbol] = price
                 self.latest_timestamps[symbol] = timestamp
 
-    async def log_prices(self):
+    async def print_prices(self):
         while True:
             current_time = time.time()
-            if current_time - self.last_log_time >= 60:
+            if current_time - self.last_print_time >= 300:  # 5 minutes
                 for symbol in self.active_symbols:
                     if symbol in self.live_prices and self.latest_timestamps[symbol]:
                         price = self.live_prices[symbol]
                         timestamp = self.latest_timestamps[symbol]
-                        queue_length = len(self.price_queue[symbol])
                         ts_str = datetime.fromtimestamp(timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
-                        logging.info(
-                            f"Symbol: {symbol} | Current Price: {price:.6f} | "
-                            f"Timestamp: {ts_str} | Queue Length: {queue_length}"
-                        )
-                self.last_log_time = current_time
-            await asyncio.sleep(1)  # Check every second
+                        print(f"{ts_str} - {symbol} Price: {price:.8f}")
+                self.last_print_time = current_time
+            await asyncio.sleep(1)
 
     async def trading_engine(self):
         while True:
@@ -308,10 +302,13 @@ class TradingBot:
                 
                 current_time = time.time()
                 for symbol in self.active_symbols:
+                    # Strictly enforce 2 position limit
+                    if len(self.positions) >= self.MAX_POSITIONS and symbol not in self.positions:
+                        continue
+                    
                     if (symbol not in self.live_prices or 
                         symbol not in self.indicators or 
-                        len(self.positions) >= self.MAX_POSITIONS or 
-                        len(self.price_queue[symbol]) < 1800):  # Ensure queue is full
+                        len(self.price_queue[symbol]) < 300):
                         continue
                     
                     price = self.live_prices[symbol]
@@ -322,38 +319,51 @@ class TradingBot:
                     if time_since_trade < self.COOLDOWN_SECONDS:
                         continue
                     
-                    # Access prices from the queue
-                    price_1min_ago = self.price_queue[symbol][1739]  # 1800 - 60 - 1
-                    price_15min_ago = self.price_queue[symbol][899]  # 1800 - 900 - 1
-                    price_30min_ago = self.price_queue[symbol][0]    # Oldest price
+                    price_1min_ago = self.price_queue[symbol][239]  # 300 - 60 - 1
+                    price_2min_ago = self.price_queue[symbol][179]  # 300 - 120 - 1
+                    price_5min_ago = self.price_queue[symbol][0]    # Oldest price (5 minutes ago)
                     
                     trend_up = indicators['ema_50_15m'] > indicators['ema_200_15m']
                     rsi_1m = indicators['rsi_1m']
                     
                     if not position:
                         if (trend_up and rsi_1m < 40 and rsi_1m > 0 and 
-                            price > price_1min_ago and price > price_15min_ago and price > price_30min_ago):
+                            price > price_1min_ago and price > price_2min_ago and price > price_5min_ago):
                             await self.enter_position(symbol, 'long', price, indicators['atr_1m'])
-                            logging.info(f"PAPER LONG {symbol}: {price:.6f} | RSI: {rsi_1m:.1f} | Capital: {self.capital:.2f}")
+                            ts_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            sl = self.positions[symbol]['stop_loss']
+                            tp = price + (indicators['atr_1m'] * self.TAKE_PROFIT_MULTIPLIER)
+                            print(f"{ts_str} - PAPER LONG {symbol}: {price:.8f} | SL: {sl:.8f} | TP: {tp:.8f} | RSI: {rsi_1m:.1f} | Capital: {self.capital:.2f}")
                         elif (not trend_up and rsi_1m > 60 and rsi_1m < 100 and 
-                              price < price_1min_ago and price < price_15min_ago and price < price_30min_ago):
+                              price < price_1min_ago and price < price_2min_ago and price < price_5min_ago):
                             await self.enter_position(symbol, 'short', price, indicators['atr_1m'])
-                            logging.info(f"PAPER SHORT {symbol}: {price:.6f} | RSI: {rsi_1m:.1f} | Capital: {self.capital:.2f}")
+                            ts_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            sl = self.positions[symbol]['stop_loss']
+                            tp = price - (indicators['atr_1m'] * self.TAKE_PROFIT_MULTIPLIER)
+                            print(f"{ts_str} - PAPER SHORT {symbol}: {price:.8f} | SL: {sl:.8f} | TP: {tp:.8f} | RSI: {rsi_1m:.1f} | Capital: {self.capital:.2f}")
                     elif position:
                         profit = (price - position['entry_price']) / position['entry_price'] * (1 if position['side'] == 'long' else -1)
+                        tp = (position['entry_price'] + (indicators['atr_1m'] * self.TAKE_PROFIT_MULTIPLIER) 
+                              if position['side'] == 'long' 
+                              else position['entry_price'] - (indicators['atr_1m'] * self.TAKE_PROFIT_MULTIPLIER))
                         if (profit > 0.005 or 
                             profit < -0.002 or 
                             (position['side'] == 'long' and price <= position['stop_loss']) or 
                             (position['side'] == 'short' and price >= position['stop_loss'])):
                             await self.exit_position(symbol, price)
-                            logging.info(f"PAPER EXIT {symbol}: {price:.6f} | Profit: {profit*100:.2f}% | Capital: {self.capital:.2f}")
+                            ts_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            print(f"{ts_str} - PAPER EXIT {symbol}: {price:.8f} | SL: {position['stop_loss']:.8f} | TP: {tp:.8f} | Profit: {profit*100:.2f}% | Capital: {self.capital:.2f}")
                 
                 await asyncio.sleep(0.1)
             except Exception as e:
-                logging.error(f"Trading engine error: {e}")
+                print(f"Trading engine error: {e}")
                 await asyncio.sleep(1)
 
     async def enter_position(self, symbol, side, price, atr):
+        # Double-check position limit before entering
+        if len(self.positions) >= self.MAX_POSITIONS:
+            return
+        
         risk_amount = self.capital * self.RISK_PER_TRADE
         position_size = min(risk_amount / (2 * atr), self.capital / price)
         position_size = max(position_size, self.min_position_size)
@@ -368,7 +378,7 @@ class TradingBot:
             'stop_loss': price - (2 * atr) if side == 'long' else price + (2 * atr),
             'entry_time': time.time()
         }
-        self.capital -= position_size * price * 0.0004  # Simulated fees
+        self.capital -= position_size * price * 0.0004
         self.last_trade_time[symbol] = time.time()
 
     async def exit_position(self, symbol, price):
@@ -385,12 +395,12 @@ class TradingBot:
         while True:
             try:
                 if not self.ws_connected or (time.time() - self.last_ws_message > self.WS_TIMEOUT):
-                    logging.warning("WebSocket connection issues detected")
+                    print("WebSocket connection issues detected")
                     if self.ws:
                         await self.ws.close()
                 await asyncio.sleep(5)
             except Exception as e:
-                logging.error(f"Monitor error: {e}")
+                print(f"Monitor error: {e}")
                 await asyncio.sleep(5)
 
 async def main():
@@ -398,7 +408,7 @@ async def main():
     try:
         await bot.initialize()
     except (KeyboardInterrupt, Exception) as e:
-        logging.error(f"Shutting down: {e}")
+        print(f"Shutting down: {e}")
         for task in bot.tasks:
             task.cancel()
         if bot.ws:
